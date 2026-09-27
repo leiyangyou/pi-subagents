@@ -28,6 +28,34 @@ import registerSubagentPromptRuntime, {
 	stripSubagentOrchestrationSkill,
 } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 
+it("ordinary child hook owns structured boundary and filters inherited resource collections", async () => {
+	for (const inheritProjectContext of [false, true]) for (const inheritGlobalContext of [false, true]) for (const inheritSkills of [false, true]) {
+		const handlers = new Map<string, Function>();
+		registerSubagentPromptRuntime({ on: (name: string, fn: Function) => handlers.set(name, fn), registerTool() {}, events: createEventBus() } as never,
+			childConfig({ inheritProjectContext, inheritGlobalContext, inheritSkills }));
+		const options = { sections: { foreign: "keep" } as Record<string, string>, customPrompt: "Child identity", appendSystemPrompt: "User addendum",
+			contextFiles: [{ path: path.join(getAgentDir(), "AGENTS.md"), content: "global" }, { path: "/project/AGENTS.md", content: "project" }],
+			skills: [{ name: "pi-subagents" }, { name: "allowed" }] };
+		const result = await handlers.get("before_agent_start")!({ systemPrompt: "Child identity", systemPromptOptions: options });
+		assert.equal(result, undefined, "ordinary child must not force the whole prompt");
+		assert.equal(options.sections.subagent_boundary, CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS);
+		assert.equal(options.sections.foreign, "keep");
+		assert.equal(options.customPrompt, "Child identity");
+		assert.equal(options.appendSystemPrompt, "User addendum");
+		assert.deepEqual(options.skills.map(skill => skill.name), inheritSkills ? ["allowed"] : []);
+		assert.deepEqual(options.contextFiles.map(file => file.content), !inheritProjectContext ? [] : inheritGlobalContext ? ["global", "project"] : ["project"]);
+	}
+});
+
+it("strips current and older XML project context without touching surrounding custom text", () => {
+	for (const gap of ["\n", "\n\n"]) {
+		const prompt = `Custom identity\n\n<project_context>${gap}Project-specific instructions\n<project_instructions path="/project/AGENTS.md">Hidden context</project_instructions>\n</project_context>\n\nCustom tail`;
+		assert.equal(stripProjectContext(prompt), "Custom identity\n\nCustom tail");
+	}
+	const unrelated = "User text mentions <project_context> inline without a rendered section.";
+	assert.equal(stripProjectContext(unrelated), unrelated);
+});
+
 function childConfig(overrides: Partial<ChildRuntimeConfig> = {}): ChildRuntimeConfig {
 	return { fanoutChild: false, depth: 1, waitTool: { enabled: true }, fast: false, ...overrides };
 }

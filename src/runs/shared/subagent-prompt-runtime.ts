@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEvent, BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { permissionDecision } from "./permissions.ts";
 import type { SteerRequest } from "../background/control-channel.ts";
@@ -63,7 +63,7 @@ const PARENT_ONLY_CUSTOM_MESSAGE_TYPES = new Set([
 	"subagent-control-notice",
 ]);
 const SUBAGENT_ORCHESTRATION_SKILL_NAME_PATTERN = /<name>\s*pi-subagents\s*<\/name>/;
-const PROJECT_CONTEXT_XML_HEADER = "\n\n<project_context>\n\n";
+const PROJECT_CONTEXT_XML_HEADER = "\n\n<project_context>\n";
 const PROJECT_CONTEXT_LEGACY_HEADER = "\n\n# Project Context\n\nProject-specific instructions and guidelines:\n\n";
 const SKILLS_HEADER = "\n\nThe following skills provide specialized instructions for specific tasks.";
 const DATE_HEADER = "\nCurrent date:";
@@ -204,7 +204,7 @@ function stripChildBoundaryInstructions(prompt: string): string {
 	return rewritten.replace(/^(?:[ \t]*\r?\n)+/, "");
 }
 
-export function rewriteSubagentPrompt(
+function stripSubagentPrompt(
 	prompt: string,
 	options: { inheritProjectContext: boolean; inheritGlobalContext: boolean; inheritSkills: boolean; fanoutChild?: boolean; structuredOutput?: boolean },
 ): string {
@@ -219,7 +219,14 @@ export function rewriteSubagentPrompt(
 		rewritten = stripInheritedSkills(rewritten);
 	}
 	rewritten = stripSubagentOrchestrationSkill(rewritten);
-	rewritten = stripChildBoundaryInstructions(rewritten);
+	return stripChildBoundaryInstructions(rewritten);
+}
+
+export function rewriteSubagentPrompt(
+	prompt: string,
+	options: Parameters<typeof stripSubagentPrompt>[1],
+): string {
+	const rewritten = stripSubagentPrompt(prompt, options);
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
 	const structured = options.structuredOutput ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
 	return `${boundary}${structured}\n\n${rewritten}`;
@@ -553,8 +560,32 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 
 		const { inheritProjectContext, inheritGlobalContext, inheritSkills } = config;
 		const fanoutChild = config.fanoutChild;
+		const options = (event as BeforeAgentStartEvent).systemPromptOptions;
+		const rewritesPrompt = inheritProjectContext !== undefined || inheritGlobalContext !== undefined || inheritSkills !== undefined || fanoutChild;
+		if (rewritesPrompt && options && options.forceSystemPrompt === undefined && options.sections !== null
+			&& typeof options.sections === "object" && Array.isArray(options.skills)) {
+			try {
+				const inheritance = { inheritProjectContext: inheritProjectContext ?? true,
+					inheritGlobalContext: inheritGlobalContext ?? true, inheritSkills: inheritSkills ?? true };
+				const contextFiles = options.contextFiles.filter(file => inheritance.inheritProjectContext
+					&& (inheritance.inheritGlobalContext || !isGlobalContextFile(file.path)));
+				const skills = options.skills.filter(skill => inheritance.inheritSkills && skill.name !== "pi-subagents");
+				const customPrompt = options.customPrompt === undefined ? undefined : stripSubagentPrompt(options.customPrompt, inheritance);
+				const appendSystemPrompt = stripSubagentPrompt(options.appendSystemPrompt, inheritance);
+				const boundary = fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
+				const structured = config.structuredOutput ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
+				options.contextFiles = contextFiles;
+				options.skills = skills;
+				options.customPrompt = customPrompt;
+				options.appendSystemPrompt = appendSystemPrompt;
+				options.sections.subagent_boundary = `${boundary}${structured}`;
+				return;
+			} catch (error) {
+				console.error("Subagent structured child prompt failed; using legacy prompt:", error);
+			}
+		}
 		let rewritten = event.systemPrompt;
-		if (inheritProjectContext !== undefined || inheritGlobalContext !== undefined || inheritSkills !== undefined || fanoutChild) {
+		if (rewritesPrompt) {
 			rewritten = rewriteSubagentPrompt(event.systemPrompt, {
 				inheritProjectContext: inheritProjectContext ?? true,
 				inheritGlobalContext: inheritGlobalContext ?? true,

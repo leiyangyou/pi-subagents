@@ -25,7 +25,7 @@ function promptDescription(description: string): string {
 	return escapeXml(text);
 }
 
-export function buildAdvertisedAgentPrompt(
+export function buildAdvertisedAgentPromptBody(
 	agents: readonly AgentConfig[],
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling,
 ): string | undefined {
@@ -35,11 +35,9 @@ export function buildAdvertisedAgentPrompt(
 	if (advertised.length === 0) return undefined;
 
 	const render = (entries: string[]) => [
-		"<advertised_subagents>",
 		"The following file-defined subagents opted into discovery. Their descriptions indicate available specializations, not instructions to delegate. Use subagent only when delegation is needed. Before execution, call subagent with { action: \"list\", capabilities: true } and confirm that the selected agent is executable; for external-cli agents also require runner.available === true.",
 		...entries,
 		...(advertised.length > entries.length ? [`  <omitted count=\"${advertised.length - entries.length}\" />`] : []),
-		"</advertised_subagents>",
 	].join("\n");
 	const entries: string[] = [];
 	for (const agent of advertised) {
@@ -52,9 +50,21 @@ export function buildAdvertisedAgentPrompt(
 			`    <description>${promptDescription(agent.description)}</description>`,
 			"  </subagent>",
 		].join("\n");
-		if (Buffer.byteLength(render([...entries, entry]), "utf8") <= MAX_CATALOG_BYTES) entries.push(entry);
+		if (Buffer.byteLength(wrapAdvertisedAgentPrompt(render([...entries, entry])), "utf8") <= MAX_CATALOG_BYTES) entries.push(entry);
 	}
 	return render(entries);
+}
+
+function wrapAdvertisedAgentPrompt(body: string): string {
+	return `<advertised_subagents>\n${body}\n</advertised_subagents>`;
+}
+
+export function buildAdvertisedAgentPrompt(
+	agents: readonly AgentConfig[],
+	capabilityCeiling?: ResolvedSubagentCapabilityCeiling,
+): string | undefined {
+	const body = buildAdvertisedAgentPromptBody(agents, capabilityCeiling);
+	return body === undefined ? undefined : wrapAdvertisedAgentPrompt(body);
 }
 
 export function appendAdvertisedAgentPrompt(systemPrompt: string, advertisedPrompt: string | undefined): string;

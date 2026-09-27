@@ -56,7 +56,14 @@ it("emits bounded file-only snapshots, refreshes through management, and perform
 			const refresh = (reason = "reload") => handlers.get("session_start").at(-2)({ reason }, ctx);
 			const emit = async (systemPrompt = "base", selectedTools = activeTools) => {
 				const result = await handlers.get("before_agent_start").at(-2)({ systemPrompt, systemPromptOptions: { selectedTools: selectedTools ?? undefined } }, ctx);
-				return result?.systemPrompt ?? systemPrompt;
+				const legacy = result?.systemPrompt ?? systemPrompt;
+				const options = { selectedTools: selectedTools ?? undefined, skills: [], sections: {}, customPrompt: systemPrompt, appendSystemPrompt: "unrelated" };
+				const structured = await handlers.get("before_agent_start").at(-2)({ systemPrompt, systemPromptOptions: options }, ctx);
+				assert.equal(structured?.systemPrompt, undefined, "supported host must not force advertisement text");
+				assert.equal(options.appendSystemPrompt, "unrelated");
+				const body = options.sections.advertised_subagents;
+				assert.equal(body ? options.customPrompt.trimEnd() + "\n\n<advertised_subagents>\n" + body + "\n</advertised_subagents>" : options.customPrompt, legacy);
+				return legacy;
 			};
 			const io = { statSync: 0, readdirSync: 0, readFileSync: 0 };
 			const originals = {};

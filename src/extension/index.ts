@@ -21,7 +21,7 @@ import { keyText, type ExtensionAPI, type ExtensionContext, type ToolDefinition 
 import { Box, Container, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { clearAgentDiscoveryCache, discoverAgentSnapshot, discoverAgents, discoverAgentsAll, type AgentConfig, type AgentScope } from "../agents/agents.ts";
 import { resolveGlobalNpmRoot } from "../agents/global-npm-root.ts";
-import { appendAdvertisedAgentPrompt, buildAdvertisedAgentPrompt } from "../agents/advertised-agent-prompt.ts";
+import { appendAdvertisedAgentPrompt, buildAdvertisedAgentPrompt, buildAdvertisedAgentPromptBody } from "../agents/advertised-agent-prompt.ts";
 import { clearRuntimeAgentsForPi, listRuntimeAgentConfigs, mergeRuntimeAgents } from "../agents/runtime-agent-registry.ts";
 import { registerRuntimeAgentEventListener } from "../agents/runtime-agent-events.ts";
 import { ensureAccessibleDir } from "../shared/accessible-dir.ts";
@@ -868,6 +868,23 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const advertisedPrompt = Array.isArray(selectedTools) && selectedTools.includes("subagent")
 			? buildAdvertisedAgentPrompt(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(sessionId))
 			: undefined;
+		const options = event.systemPromptOptions;
+		if (options && options.forceSystemPrompt === undefined && options.sections !== null
+			&& typeof options.sections === "object" && Array.isArray(options.skills)) {
+			try {
+				const body = advertisedPrompt === undefined ? undefined
+					: buildAdvertisedAgentPromptBody(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(sessionId));
+				const customPrompt = options.customPrompt === undefined ? undefined : appendAdvertisedAgentPrompt(options.customPrompt, undefined);
+				const appendSystemPrompt = appendAdvertisedAgentPrompt(options.appendSystemPrompt, undefined);
+				options.customPrompt = customPrompt;
+				options.appendSystemPrompt = appendSystemPrompt;
+				if (body === undefined) delete options.sections.advertised_subagents;
+				else options.sections.advertised_subagents = body;
+				return;
+			} catch (error) {
+				console.error("Subagent structured advertisement failed; using legacy prompt:", error);
+			}
+		}
 		const systemPrompt = appendAdvertisedAgentPrompt(event.systemPrompt, advertisedPrompt);
 		if (systemPrompt !== event.systemPrompt) return { systemPrompt };
 	});

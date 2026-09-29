@@ -273,6 +273,8 @@ The file catalog snapshot refreshes at session start/reload and after extension-
 
 The catalog is sent as Pi's `advertised_subagents` prompt section. When it changes mid-session, Pi appends it as a small system message instead of changing the system prompt, so the provider prompt cache is kept. This only works if no other loaded extension returns a replacement `systemPrompt` from `before_agent_start`; in that case Pi folds section changes back into the system prompt and the cache is lost for that request.
 
+Known limitation: the advertisement gate checks `systemPromptOptions.selectedTools`. Withholding `subagent` can therefore leave roster names and descriptions in the prompt when the explicit selection still includes it. This pre-existing metadata exposure is not fixed here; execution permissions remain separate.
+
 ## Prompt assembly
 
 Subagents are narrow by default. Custom agents start with a clean system prompt and only the context you intentionally give them. They do not automatically inherit Pi's whole base prompt, project instruction files, or discovered skills catalog.

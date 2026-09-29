@@ -8,7 +8,8 @@ import { deliverStopRequest, stopInboxClosedPath } from "../background/control-c
 import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
+import { readStatus } from "../../shared/utils.ts";
+import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 
 function getAsyncStopTarget(
 	state: SubagentState,
@@ -108,6 +109,16 @@ export function stopAsyncRun(
 	childId?: string,
 ): AgentToolResult<Details> | null {
 	const target = getAsyncStopTarget(state, runId, location);
+	// An async workflow runs in this process: it has no runner to read a stop request, so stop it through its controller.
+	const workflowRunId = target?.asyncId ?? runId;
+	const workflowController = childId === undefined && workflowRunId ? state.workflowControllers?.get(workflowRunId) : undefined;
+	if (workflowController && workflowRunId) {
+		const workflowAsyncDir = target?.asyncDir ?? state.asyncJobs.get(workflowRunId)?.asyncDir;
+		const workflowStatus = workflowAsyncDir ? readStatus(workflowAsyncDir) : undefined;
+		if (workflowStatus) stopStoppableAsyncStatusChildren(workflowStatus, state.workflowChildStops?.get(workflowRunId), "Workflow stopped.");
+		workflowController.abort(new Error("Workflow stopped."));
+		return { content: [{ type: "text", text: `Stop requested for async workflow ${workflowRunId}.` }], details: { mode: "management", results: [] } };
+	}
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
 	if (state.currentSessionId && status?.sessionId !== state.currentSessionId) {

@@ -15,7 +15,7 @@ import { runSync } from "../../src/runs/foreground/execution.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
-import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
+import registerSubagentPromptRuntime, { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -673,7 +673,8 @@ function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add",
 	const loaded: Array<{ name: string; replaceable?: boolean }> = [];
 	const lifecycle: string[] = [];
 	let allowlist: string[] = [];
-	const pi = stubPi({ extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools: () => [...registry].map(([name, exposure]) => ({ name, exposure })).filter(({ name }) => allowlist.includes(name)), getActiveToolNames: () => [...registry].filter(([name, exposure]) => exposure === "direct" && allowlist.includes(name)).map(([name]) => name) });
+	const session = { bindExtensions: async () => {}, extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools: () => [...registry].map(([name, exposure]) => ({ name, exposure })).filter(({ name }) => allowlist.includes(name)), getActiveToolNames: () => [...registry].filter(([name, exposure]) => exposure === "direct" && allowlist.includes(name)).map(([name]) => name) };
+	const pi = stubPi(session);
 	Object.assign(pi, { createMcpExtension: () => (api: { registerTool(tool: { name: string; label: string; exposure: string }): void }) => {
 		setTimeout(() => { for (const [name, label] of tools) api.registerTool({ name: name!, label: label!, exposure: "codemode" }); }, 20);
 	} });
@@ -691,8 +692,158 @@ function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add",
 	} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
 	const createSession = pi.createAgentSession;
 	pi.createAgentSession = ((options: { tools?: string[] }) => { allowlist = options.tools ?? []; return createSession(options); }) as PiCodingAgentModule["createAgentSession"];
-	return { pi, registry, loaded, lifecycle };
+	return { pi, registry, loaded, lifecycle, session };
 }
+
+describe("raw native MCP readiness in a child session", () => {
+	const rawLaunch: ChildSessionLaunch = { ...stubLaunch, tools: ["mcp__srv__echo", "mcp__srv__add"], runtime: { ...stubLaunch.runtime, requiredTools: ["mcp__srv__echo", "mcp__srv__add"] } };
+
+	it("waits for delayed codemode and deferred definitions without making them direct", async () => {
+		const mcp = builtinMcpPi();
+		const bound = Promise.withResolvers<void>();
+		const connect = Promise.withResolvers<void>();
+		mcp.session.bindExtensions = async () => {
+			void connect.promise.then(() => {
+				mcp.registry.set("mcp__srv__echo", "codemode");
+				mcp.registry.set("mcp__srv__add", "deferred");
+			});
+			bound.resolve();
+		};
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 1_000, loadPiCodingAgent: async () => mcp.pi });
+		let created = false;
+		const creating = factory.create(rawLaunch).then((child) => { created = true; return child; });
+		try {
+			await bound.promise;
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(created, false, "a usable child must not escape before required MCP definitions register");
+			connect.resolve();
+			const child = await creating;
+			assert.deepEqual(mcp.session.getAllTools(), [{ name: "mcp__srv__echo", exposure: "codemode" }, { name: "mcp__srv__add", exposure: "deferred" }]);
+			assert.deepEqual(mcp.session.getActiveToolNames(), []);
+			assert.deepEqual(mcp.loaded, [], "raw names do not select the direct-exposure MCP wrapper");
+			await child.dispose();
+		} finally {
+			connect.resolve();
+			await factory.dispose();
+		}
+	});
+
+	it("allows prompt-lazy bridge tools after MCP readiness while retaining full agent-start validation", async () => {
+		for (const missingOther of [false, true]) {
+			const mcp = builtinMcpPi();
+			const diagnostics: Array<string[] | undefined> = [];
+			const errors: string[] = [];
+			const handlers = new Map<string, Array<(event: { type: string }) => unknown>>();
+			let prompts = 0;
+			const requiredTools = [...rawLaunch.tools!, "ctx_execute", ...(missingOther ? ["fixture_search"] : [])];
+			const runtime = { ...rawLaunch.runtime, requiredTools, toolDiagnostic: (diagnostic: Parameters<NonNullable<ChildSessionLaunch["runtime"]["toolDiagnostic"]>>[0]) => diagnostics.push(diagnostic?.missing) };
+			mcp.session.bindExtensions = async () => {
+				mcp.registry.set("mcp__srv__echo", "codemode");
+				mcp.registry.set("mcp__srv__add", "deferred");
+				const api = {
+					on: (event: string, handler: (event: { type: string }) => unknown) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+					getAllTools: mcp.session.getAllTools,
+					registerTool: (tool: { name: string; exposure?: string }) => mcp.registry.set(tool.name, tool.exposure ?? "direct"),
+				};
+				// Context-mode awaits its bridge only during the prompt's before_agent_start.
+				api.on("before_agent_start", async () => {
+					await Promise.resolve();
+					mcp.registry.set("ctx_execute", "direct");
+				});
+				registerSubagentPromptRuntime(api as never, runtime);
+			};
+			Object.assign(mcp.session, { prompt: async () => {
+				prompts += 1;
+				for (const type of ["before_agent_start", "agent_start"]) {
+					for (const handler of handlers.get(type) ?? []) {
+						try { await handler({ type }); }
+						catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+					}
+				}
+			} });
+			const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 1_000, loadPiCodingAgent: async () => mcp.pi });
+			try {
+				const child = await factory.create({ ...rawLaunch, tools: requiredTools, runtime });
+				assert.equal(prompts, 0);
+				assert.equal(mcp.registry.has("ctx_execute"), false, "factory must permit the supported lazy bridge lifecycle");
+				await child.prompt("Use the requested tools.");
+				assert.deepEqual(diagnostics, missingOther ? [["fixture_search"]] : [undefined]);
+				if (missingOther) assert.match(errors[0] ?? "", /requested unavailable child tools: fixture_search/);
+				assert.equal(errors.length, missingOther ? 1 : 0, "real strict hook errors are reported, not suppressed");
+				await child.dispose();
+				assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
+			} finally {
+				await factory.dispose();
+			}
+		}
+	});
+
+	it("rejects absent raw names before prompting and awaits shutdown before disposal", { timeout: 2_000 }, async () => {
+		const mcp = builtinMcpPi();
+		const shutdownStarted = Promise.withResolvers<void>();
+		const finishShutdown = Promise.withResolvers<void>();
+		let prompts = 0;
+		Object.assign(mcp.session, { prompt: async () => { prompts += 1; } });
+		mcp.session.extensionRunner.emit = async () => {
+			mcp.lifecycle.push("session_shutdown");
+			shutdownStarted.resolve();
+			await finishShutdown.promise;
+		};
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 30, loadPiCodingAgent: async () => mcp.pi });
+		let settled = false;
+		const creating = factory.create(rawLaunch).then(async (child) => { await child.prompt("must not run"); }).finally(() => { settled = true; });
+		const rejected = assert.rejects(creating, /requested unavailable child tools: mcp__srv__echo, mcp__srv__add/);
+		try {
+			await shutdownStarted.promise;
+			assert.equal(settled, false, "create must await extension shutdown before rejecting");
+			assert.deepEqual(mcp.lifecycle, ["session_shutdown"]);
+			finishShutdown.resolve();
+			await rejected;
+			assert.equal(prompts, 0);
+			assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
+		} finally {
+			finishShutdown.resolve();
+			await factory.dispose();
+		}
+	});
+
+	it("keeps an asynchronously registered unlisted sibling outside the child registry", async () => {
+		const mcp = builtinMcpPi();
+		mcp.session.bindExtensions = async () => {
+			setImmediate(() => {
+				mcp.registry.set("mcp__srv__echo", "codemode");
+				mcp.registry.set("mcp__srv__add", "deferred");
+			});
+		};
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 1_000, loadPiCodingAgent: async () => mcp.pi });
+		const child = await factory.create({ ...rawLaunch, tools: ["mcp__srv__echo"], runtime: { ...rawLaunch.runtime, requiredTools: ["mcp__srv__echo"] } });
+		try {
+			// Same allowlist-filtered definition boundary as Pi's AgentSession.getAllTools(), not a fake executeTool model.
+			assert.deepEqual(mcp.session.getAllTools(), [{ name: "mcp__srv__echo", exposure: "codemode" }]);
+			assert.equal(mcp.registry.get("mcp__srv__add"), "deferred", "the sibling registered but was not granted");
+		} finally {
+			await child.dispose();
+			await factory.dispose();
+		}
+	});
+
+	it("cancels a raw-name readiness wait and awaits cleanup on factory disposal", { timeout: 2_000 }, async () => {
+		const mcp = builtinMcpPi();
+		const bound = Promise.withResolvers<void>();
+		let prompts = 0;
+		Object.assign(mcp.session, { prompt: async () => { prompts += 1; } });
+		mcp.session.bindExtensions = async () => { bound.resolve(); };
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 5_000, loadPiCodingAgent: async () => mcp.pi });
+		const creating = factory.create(rawLaunch).then(async (child) => { await child.prompt("must not run"); });
+		const rejected = assert.rejects(creating, /disposed while the child waited for its MCP tools/);
+		await bound.promise;
+		await new Promise((resolve) => setImmediate(resolve));
+		await factory.dispose();
+		await rejected;
+		assert.equal(prompts, 0);
+		assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
+	});
+});
 
 describe("selected built-in MCP tools in a child session", () => {
 	const mcpLaunch: ChildSessionLaunch = { ...stubLaunch, tools: ["read", "mcp__srv__echo"], builtinMcpTools: [{ name: "mcp__srv__echo", selector: "srv/echo" }] };

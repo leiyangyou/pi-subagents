@@ -18,7 +18,8 @@ import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
 import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import { resolvePackageSubpath } from "../background/runner-aliases.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "./pi-spawn.ts";
-import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { evaluateChildToolDiagnostic, type ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { formatChildToolDiagnostic } from "./tool-availability.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
@@ -151,7 +152,7 @@ export interface DefaultChildSessionFactoryOptions {
 	loadPiCodingAgent?: () => Promise<PiCodingAgentModule>;
 	/** Upper bound on a disposed child's `session_shutdown` handlers before the session is dropped anyway. */
 	shutdownTimeoutMs?: number;
-	/** Upper bound on the wait for selected built-in MCP tools to register after the session starts. */
+	/** Upper bound on the wait for requested native MCP tools to register after the session starts. */
 	builtinMcpToolWaitMs?: number;
 }
 
@@ -291,13 +292,15 @@ function selectedBuiltinMcpExtension(pi: PiCodingAgentModule, selections: Readon
 	return { name: "mcp", factory, builtin: true, replaceable: true };
 }
 
-/** MCP connects after `session_start`, so the selected tools register some time after the session binds. */
-async function missingBuiltinMcpTools(session: { getAllTools(): Array<{ name: string }>; getActiveToolNames(): string[] }, names: readonly string[], timeoutMs: number, stopped: () => boolean): Promise<string[]> {
+/** MCP connects after `session_start`; raw names need definitions, selected `mcp:` tools also need direct exposure. */
+async function missingBuiltinMcpTools(session: { getAllTools(): Array<{ name: string }>; getActiveToolNames(): string[] }, names: readonly string[], directNames: readonly string[], timeoutMs: number, stopped: () => boolean): Promise<string[]> {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
+		const tools = session.getAllTools();
+		const registered = new Set(tools.map(({ name }) => name));
 		const active = new Set(session.getActiveToolNames());
-		const direct = new Set(session.getAllTools().filter((tool) => (tool as { exposure?: string }).exposure === "direct").map(({ name }) => name));
-		const missing = names.filter((name) => !active.has(name) || !direct.has(name));
+		const direct = new Set(tools.filter((tool) => (tool as { exposure?: string }).exposure === "direct").map(({ name }) => name));
+		const missing = names.filter((name) => !registered.has(name) || (directNames.includes(name) && (!active.has(name) || !direct.has(name))));
 		if (missing.length === 0 || stopped() || Date.now() >= deadline) return missing;
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
@@ -560,14 +563,18 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			let pending: Promise<void> | undefined;
 			const shutdown = () => shutdownSession(session);
 			// Outside the launch lock: MCP servers connect after `session_start` without reading the per-launch env.
-			if (builtinMcpTools.length) {
+			const directMcpNames = builtinMcpTools.map(({ name }) => name);
+			const mcpNames = [...new Set([...directMcpNames, ...[...(launch.tools ?? []), ...(launch.runtime.requiredTools ?? [])].filter((name) => name.startsWith("mcp__"))])];
+			if (mcpNames.length) {
 				const disposed = () => disposals !== disposalsAtStart;
-				const ready = missingBuiltinMcpTools(session, builtinMcpTools.map(({ name }) => name), builtinMcpToolWaitMs, disposed).then(async (missing) => {
-					if (!missing.length && !disposed()) return;
+				const ready = missingBuiltinMcpTools(session, mcpNames, directMcpNames, builtinMcpToolWaitMs, disposed).then(async (missing) => {
+					// Other extensions may register their tools in before_agent_start; the full strict check stays in agent_start.
+					const diagnostic = evaluateChildToolDiagnostic({ ...launch.runtime, requiredTools: mcpNames }, session.getAllTools().map(({ name }) => name));
+					if (!missing.length && !diagnostic && !disposed()) return;
 					await shutdown();
-					throw new Error(disposed()
-						? "The child session factory was disposed while the child waited for its MCP tools."
-						: `Selected built-in MCP tools did not register in the child session: ${missing.join(", ")}. The MCP server may have failed to connect, or the name belongs to a different tool than the selector names; check it with /mcp.`);
+					if (disposed()) throw new Error("The child session factory was disposed while the child waited for its MCP tools.");
+					if (missing.some((name) => directMcpNames.includes(name))) throw new Error(`Selected built-in MCP tools did not register in the child session: ${missing.join(", ")}. The MCP server may have failed to connect, or the name belongs to a different tool than the selector names; check it with /mcp.`);
+					throw new Error(diagnostic ? formatChildToolDiagnostic(diagnostic) : `Requested native MCP tools did not register in the child session: ${missing.join(", ")}.`);
 				});
 				mcpWaits.add(ready);
 				try { await ready; } finally { mcpWaits.delete(ready); }
